@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "carrie-tabboard"
+version = "0.1.0"
+description = "实时 Chrome tab 看板：自动归类、点击跳转、关闭、去重 (macOS)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Carrie" }]
+keywords = ["chrome", "tabs", "macos", "productivity"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+]
+# 只用标准库，无第三方依赖
+dependencies = []
+
+[project.scripts]
+# 装好后，命令 `tabboard` => 运行 tab_board.py 里的 main()
+tabboard = "tab_board:main"
+
+[tool.setuptools]
+# 这是个单文件模块，告诉 setuptools 打包 tab_board.py
+py-modules = ["tab_board"]
