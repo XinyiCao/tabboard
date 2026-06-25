@@ -30,7 +30,37 @@ CATS = [
     ("pbday",   "🎉", "Personal · 生日派对 & Shopping"),
     ("other",   "📦", "其他 / 未分类"),
 ]
-CAT_META = {k: (e, n) for k, e, n in CATS}
+# ---------- 自定义分类（用户新建，参与分组，持久化）----------
+CATEGORIES_FILE = Path.home() / ".tabboard_categories.json"
+
+def load_categories():
+    try:
+        return json.loads(CATEGORIES_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+def save_categories(d):
+    try:
+        backup_file(CATEGORIES_FILE)
+        CATEGORIES_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print("⚠️ 保存自定义分类失败:", e)
+
+CUSTOM_CATS = load_categories()   # [{"key","emoji","name"}, ...]
+
+def all_cats():
+    """内置分类 + 自定义分类（自定义插在「其他」之前）。"""
+    rest = [c for c in CATS if c[0] != "other"]
+    other = [c for c in CATS if c[0] == "other"]
+    custom = [(c["key"], c.get("emoji", "🏷️"), c["name"]) for c in CUSTOM_CATS]
+    return rest + custom + other
+
+def rebuild_meta():
+    global CAT_META, VALID_KEYS
+    CAT_META = {k: (e, n) for k, e, n in all_cats()}
+    VALID_KEYS = set(CAT_META)
+
+rebuild_meta()
 
 RULES = [   # (cat_key, [关键词 — 命中 title+url(小写) 任意一个即归类])
     ("oneone",  ["carrie /", " 1:1", "1:1 -"]),
@@ -124,7 +154,7 @@ def save_library(d):
 LIBRARY = load_library()   # {url: {url, title, ts}}
 
 def categorize(title, url):
-    if url in OVERRIDES:                 # 你手动拖过的，优先听你的
+    if url in OVERRIDES and OVERRIDES[url] in VALID_KEYS:   # 手动拖过的优先（且该分类仍存在）
         return OVERRIDES[url]
     blob = (title + " " + url).lower()
     for key, kws in RULES:
@@ -173,12 +203,14 @@ def read_tabs():
                      "title": title.strip() or url, "url": url.strip()})
     return tabs
 
-def group_by_cat(items):
+def group_by_cat(items, include_empty=()):
+    custom_keys = {c["key"] for c in CUSTOM_CATS}
     out = []
-    for key, emoji, name in CATS:
+    for key, emoji, name in all_cats():
         g = [it for it in items if categorize(it["title"], it["url"]) == key]
-        if g:
-            out.append({"key": key, "emoji": emoji, "name": name, "tabs": g})
+        if g or key in include_empty:               # 空的自定义分类也显示（可作拖放目标）
+            out.append({"key": key, "emoji": emoji, "name": name, "tabs": g,
+                        "custom": key in custom_keys})
     return out
 
 def grouped():
@@ -193,7 +225,8 @@ def grouped():
         it2["idle_days"] = (now - lo) // 86400
         it2["stale"] = (now - lo) > 30 * 86400      # 超 30 天没点 = 久未访问
         libvals.append(it2)
-    return {"cats": group_by_cat(tabs), "total": len(tabs),
+    custom_keys = {c["key"] for c in CUSTOM_CATS}
+    return {"cats": group_by_cat(tabs, include_empty=custom_keys), "total": len(tabs),
             "parked": parked_list(),
             "library": group_by_cat(libvals)}
 
@@ -203,9 +236,10 @@ def activate(wid, tid):
       set i to 0
       repeat with t in tabs of theWin
         set i to i + 1
-        if id of t is {tid} then
+        if (id of t as string) is "{tid}" then
           set active tab index of theWin to i
           set index of theWin to 1
+          exit repeat
         end if
       end repeat
       activate
@@ -292,6 +326,29 @@ def lib_open(url):
         save_library(LIBRARY)
     open_url(url)
 
+def add_cat(name, emoji="🏷️"):
+    name = (name or "").strip() or "新分类"
+    key = "c%d" % int(time.time() * 1000)
+    while key in VALID_KEYS:
+        key += "x"
+    CUSTOM_CATS.append({"key": key, "emoji": emoji or "🏷️", "name": name})
+    save_categories(CUSTOM_CATS)
+    rebuild_meta()
+    return key
+
+def del_cat(key):
+    global CUSTOM_CATS
+    if not any(c["key"] == key for c in CUSTOM_CATS):
+        return
+    CUSTOM_CATS = [c for c in CUSTOM_CATS if c["key"] != key]
+    save_categories(CUSTOM_CATS)
+    gone = [u for u, k in OVERRIDES.items() if k == key]   # 该分类下的 tab 回到自动分类
+    for u in gone:
+        OVERRIDES.pop(u, None)
+    if gone:
+        save_overrides(OVERRIDES)
+    rebuild_meta()
+
 # ---------- HTTP ----------
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -328,23 +385,33 @@ class H(BaseHTTPRequestHandler):
         elif p == "/api/libfromparked": lib_from_parked(data.get("url"))  # 暂存 -> 收藏夹
         elif p == "/api/libopen": lib_open(data.get("url"))               # 打开收藏（不移除，刷新最后访问）
         elif p == "/api/libremove": lib_remove(data.get("url"))           # 移除收藏
+        elif p == "/api/addcat":  return self._send(json.dumps({"key": add_cat(data.get("name"), data.get("emoji", "🏷️"))}))
+        elif p == "/api/delcat":  del_cat(data.get("cat"))                 # 删除自定义分类
         self._send(json.dumps({"ok": True}))
 
 PAGE = r"""<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>📑 Carrie's Tab Board · live</title>
 <style>
-:root{--bg:#0f1115;--panel:#171a21;--panel2:#1d212b;--line:#2a2f3a;--txt:#e6e8ee;--muted:#8b93a7;--accent:#7aa2ff;--warn:#ffb454}
+:root{--bg:#0f1115;--panel:#171a21;--panel2:#1d212b;--line:#2a2f3a;--txt:#e6e8ee;--muted:#8b93a7;--accent:#7aa2ff;--warn:#ffb454;--headerbg:rgba(15,17,21,.92)}
+:root[data-theme="light"]{--bg:#f4f5f7;--panel:#ffffff;--panel2:#eceff3;--line:#dce1e8;--txt:#1b2130;--muted:#6a7585;--accent:#2f6bff;--warn:#c1761a;--headerbg:rgba(244,245,247,.92)}
+:root[data-theme="everforest-light"]{--bg:#fdf6e3;--panel:#f4f0d9;--panel2:#efebd4;--line:#e0dcc7;--txt:#5c6a72;--muted:#939f91;--accent:#3a94c5;--warn:#f57d26;--headerbg:rgba(253,246,227,.92)}
+:root[data-theme="iceberg-light"]{--bg:#e8e9ec;--panel:#f3f4f6;--panel2:#dcdfe7;--line:#cad0de;--txt:#33374c;--muted:#8389a3;--accent:#2d539e;--warn:#c57339;--headerbg:rgba(232,233,236,.92)}
+:root[data-theme="solarized-light"]{--bg:#fdf6e3;--panel:#eee8d5;--panel2:#e7e0c9;--line:#ddd6be;--txt:#586e75;--muted:#93a1a1;--accent:#268bd2;--warn:#cb4b16;--headerbg:rgba(253,246,227,.92)}
+:root[data-theme="tokyonight-day"]{--bg:#e1e2e7;--panel:#eaeaee;--panel2:#d6d8e0;--line:#c4c8da;--txt:#343b58;--muted:#848cb5;--accent:#2e7de9;--warn:#b15c00;--headerbg:rgba(225,226,231,.92)}
+:root[data-theme="zenwritten-light"]{--bg:#eeeeee;--panel:#f6f6f6;--panel2:#e2e2e2;--line:#d2d2d2;--txt:#353535;--muted:#8a8784;--accent:#286486;--warn:#803d1c;--headerbg:rgba(238,238,238,.92)}
+:root[data-theme="ayu-dark"]{--bg:#0b0e14;--panel:#0d1017;--panel2:#131721;--line:#1f2430;--txt:#bfbdb6;--muted:#565b66;--accent:#59c2ff;--warn:#ffb454;--headerbg:rgba(11,14,20,.92)}
+:root[data-theme="github-dark"]{--bg:#0d1117;--panel:#161b22;--panel2:#1c2128;--line:#30363d;--txt:#c9d1d9;--muted:#8b949e;--accent:#58a6ff;--warn:#d29922;--headerbg:rgba(13,17,23,.92)}
 *{box-sizing:border-box}
 body{margin:0;font-family:-apple-system,"PingFang SC","Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--txt);font-size:14px;line-height:1.45}
-header{position:sticky;top:0;z-index:20;background:rgba(15,17,21,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);padding:12px 22px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+header{position:sticky;top:0;z-index:20;background:var(--headerbg);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);padding:12px 22px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
 header h1{font-size:17px;margin:0;font-weight:600}
 .stat{color:var(--muted);font-size:12.5px}
 .dot{width:7px;height:7px;border-radius:50%;background:#3ddc84;display:inline-block;margin-right:5px;animation:p 2s infinite}
 @keyframes p{50%{opacity:.3}}
 .controls{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-#search{background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:7px 11px;width:220px;outline:none}
-#search:focus{border-color:var(--accent)}
+.searchbar{background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:7px 11px;width:200px;outline:none;cursor:text}
+.searchbar:hover,.searchbar:focus{border-color:var(--accent)}
 .btn{background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:7px 11px;cursor:pointer;font-size:13px}
 .btn:hover{border-color:var(--accent)}
 .grid{display:flex;gap:18px;align-items:flex-start;padding:16px 22px 60px}
@@ -358,6 +425,11 @@ section.cat{position:relative;background:var(--panel);border:1px solid var(--lin
 .cat-head .emoji{font-size:17px}.cat-head .name{font-weight:600}.cat-head .count{color:var(--muted);font-size:12px}
 .cat-head .closeg{margin-left:auto;font-size:11.5px;color:var(--muted);cursor:pointer;border:1px solid var(--line);border-radius:6px;padding:3px 8px}
 .cat-head .closeg:hover{color:var(--warn);border-color:var(--warn)}
+.cat-head .delcat{font-size:12px;color:var(--muted);cursor:pointer;border:1px solid var(--line);border-radius:6px;padding:3px 7px}
+.cat-head .delcat:hover{color:var(--warn);border-color:var(--warn)}
+li.hint{justify-content:center;color:var(--muted);font-size:12px;cursor:default;padding:14px 8px;border:1px dashed var(--line);border-radius:8px;margin:2px}
+li.hint:hover{background:none}
+section.cat.custom .cat-head{background:linear-gradient(180deg,rgba(122,162,255,.14),transparent)}
 .cat-body{display:grid;grid-template-rows:1fr;transition:grid-template-rows .28s cubic-bezier(.4,0,.2,1),opacity .2s ease}
 .cat.collapsed .cat-body{grid-template-rows:0fr;opacity:.4}
 ul{list-style:none;margin:0;padding:6px;overflow:hidden;min-height:0}
@@ -365,7 +437,7 @@ li{display:flex;align-items:center;gap:9px;padding:6px 8px;border-radius:8px;cur
 li:hover{background:var(--panel2)}
 li:active{cursor:grabbing}
 li.drag{opacity:.4}
-section.cat.dropping{outline:2px dashed var(--accent);outline-offset:-3px;background:#1a2030}
+section.cat.dropping{outline:2px dashed var(--accent);outline-offset:-3px;background:rgba(122,162,255,.12)}
 .grip{color:var(--muted);cursor:grab;font-size:14px;flex:none;line-height:1;letter-spacing:-3px;padding-right:2px}
 .grip:active{cursor:grabbing}
 .cat-head:hover .grip{color:var(--txt)}
@@ -375,52 +447,114 @@ section.cat.drag{opacity:.45}
 .cat.insert-before::before,.cat.insert-after::after{content:"";position:absolute;left:0;right:0;height:3px;border-radius:3px;background:var(--accent);box-shadow:0 0 7px var(--accent);z-index:5}
 .cat.insert-before::before{top:-10px}
 .cat.insert-after::after{bottom:-10px}
-li img{width:16px;height:16px;border-radius:3px;flex:none;background:#222}
+li img{width:16px;height:16px;border-radius:3px;flex:none;background:var(--panel2)}
 li .title,li .ptitle,li .ltitle{color:var(--txt);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
 li .title:hover,li .ptitle:hover,li .ltitle:hover{color:var(--accent)}
 li .age{flex:none;color:var(--muted);font-size:11px}
 li .x,li .park,li .del,li .star,li .pstar,li .libdel{flex:none;color:var(--muted);cursor:pointer;border-radius:5px;padding:0 6px;font-size:13px;opacity:0;visibility:hidden;filter:grayscale(1)}
 li:hover .x,li:hover .park,li:hover .del,li:hover .star,li:hover .pstar,li:hover .libdel{opacity:1;visibility:visible}
-li .x:hover,li .del:hover,li .libdel:hover{color:var(--warn);background:#3a2a18;filter:none}
-li .park:hover{color:#3ddc84;background:#16301f}
-li .star:hover,li .pstar:hover{background:#332a10;filter:none}
+li .x:hover,li .del:hover,li .libdel:hover{color:var(--warn);background:rgba(255,180,84,.16);filter:none}
+li .park:hover{color:#1aa85a;background:rgba(61,220,132,.16)}
+li .star:hover,li .pstar:hover{background:rgba(255,200,61,.2);filter:none}
 li .star.saved{opacity:1;visibility:visible;filter:none;color:#ffc83d}
 li .age.stale{color:var(--warn)}
 #notice{padding:0 22px}
-.review{background:#2a2113;border:1px solid #5a4420;border-radius:10px;padding:10px 14px;margin:12px 0 0;display:flex;align-items:center;gap:10px;color:#ffd98a;font-size:13px}
-.review b{color:#ffc83d}
+.review{background:rgba(255,180,84,.12);border:1px solid rgba(255,180,84,.5);border-radius:10px;padding:10px 14px;margin:12px 0 0;display:flex;align-items:center;gap:10px;color:var(--warn);font-size:13px}
+.review b{color:var(--warn);font-weight:700}
 .review .btn{padding:5px 10px;font-size:12.5px}
-section.cat[data-key="__parked__"]{border-color:#5a4420}
-section.cat[data-key="__parked__"] .cat-head{background:linear-gradient(180deg,#2a2113,var(--panel))}
+.rename{font:inherit;font-weight:600;background:var(--bg);border:1px solid var(--accent);border-radius:5px;color:var(--txt);padding:1px 6px;width:170px;outline:none}
+section.cat[data-key="__parked__"]{border-color:rgba(255,180,84,.5)}
+section.cat[data-key="__parked__"] .cat-head{background:linear-gradient(180deg,rgba(255,180,84,.14),transparent)}
 .empty{color:var(--muted);text-align:center;padding:80px 0}
+.themewrap{position:relative}
+.menu{position:absolute;right:0;top:calc(100% + 8px);background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:6px;box-shadow:0 14px 44px rgba(0,0,0,.4);min-width:200px;z-index:40}
+.menu-hidden{display:none}
+.menu-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;cursor:pointer;font-size:13px;color:var(--txt)}
+.menu-item:hover{background:var(--panel2)}
+.menu-item.active{background:var(--panel2)}
+.menu-item.active::after{content:"✓";margin-left:auto;color:var(--accent);font-weight:700}
+.sw{width:18px;height:18px;border-radius:6px;flex:none;border:1px solid var(--line)}
+#spot{position:fixed;inset:0;z-index:50;display:flex;flex-direction:column;align-items:center;padding-top:13vh;background:rgba(0,0,0,.32);backdrop-filter:blur(2px);animation:spotin .12s ease}
+#spot.spot-hidden{display:none}
+@keyframes spotin{from{opacity:0}to{opacity:1}}
+#spotInput{width:min(580px,88vw);font-size:19px;padding:15px 20px;border-radius:14px;border:1px solid var(--accent);background:var(--panel);color:var(--txt);outline:none;box-shadow:0 18px 55px rgba(0,0,0,.45)}
+.spot-hint{margin-top:11px;color:#e9ecf3;font-size:12.5px;opacity:.9;text-shadow:0 1px 4px rgba(0,0,0,.6)}
+/* 🍀 彩蛋：平时隐藏，鼠标移到右下角才浮现 */
+#lucky{position:fixed;right:18px;bottom:16px;z-index:60;width:42px;height:42px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:22px;cursor:pointer;background:var(--panel);border:1px solid var(--line);box-shadow:0 6px 20px rgba(0,0,0,.35);opacity:0;transform:translateY(12px) scale(.7);pointer-events:none;transition:opacity .25s ease,transform .25s ease}
+#lucky.show{opacity:.93;transform:none;pointer-events:auto}
+#lucky:hover{opacity:1;transform:scale(1.13)}
+#lucky.spin{animation:luckyspin .7s cubic-bezier(.3,1.4,.5,1)}
+@keyframes luckyspin{to{transform:rotate(360deg)}}
+#luckyBox{position:fixed;right:18px;bottom:66px;z-index:60;display:flex;flex-direction:column;align-items:flex-end;gap:8px;pointer-events:none}
+#luckyTag{font-size:12px;font-weight:600;letter-spacing:.02em;color:var(--accent);text-shadow:0 1px 8px rgba(0,0,0,.3);opacity:0;transform:translateY(6px);transition:opacity .22s ease,transform .22s ease}
+#luckyTag.show{opacity:1;transform:none}
+#luckyToast{max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;background:var(--panel);border:1px solid var(--line);color:var(--txt);padding:6px 12px;border-radius:999px;font-size:12px;box-shadow:0 6px 22px rgba(0,0,0,.16);opacity:0;transform:translateY(6px);transition:opacity .22s ease,transform .22s ease}
+#luckyToast.show{opacity:1;transform:none}
+.confetti{position:fixed;z-index:59;width:7px;height:7px;border-radius:50%;pointer-events:none}
 footer{color:var(--muted);font-size:11.5px;padding:0 22px 40px;text-align:center}
+.hints{line-height:1.6}
+.tagline{margin-top:13px;font-size:11px;font-weight:400;color:var(--muted);opacity:.7;letter-spacing:.1em}
+.copyright{margin-top:5px;font-size:11px;opacity:.55;letter-spacing:.03em}
+.copyright a{color:inherit;text-decoration:none;border-bottom:1px solid transparent;transition:color .15s,border-color .15s}
+.copyright a:hover{color:var(--accent);border-bottom-color:var(--accent)}
 </style></head><body>
+<script>document.documentElement.dataset.theme=localStorage.getItem('tb_theme')||'dark';</script>
 <header>
   <h1>📑 Tab Board</h1>
   <span class="stat"><span class="dot"></span><span id="stat">读取中…</span></span>
   <div class="controls">
-    <input id="search" placeholder="🔍 搜索标题…">
+    <input class="searchbar" id="searchBar" placeholder="🔍 搜索标题…" readonly>
+    <button class="btn" id="addcat">＋ 新建分类</button>
     <button class="btn" id="libBtn">📚 收藏夹</button>
     <button class="btn" id="dedup">🧹 一键去重</button>
     <button class="btn" id="refresh">↻ 刷新</button>
+    <div class="themewrap">
+      <button class="btn" id="themeBtn" title="主题配色">🎨 主题</button>
+      <div id="themeMenu" class="menu menu-hidden">
+        <div class="menu-item" data-theme="dark"><span class="sw" style="background:linear-gradient(135deg,#171a21 0 50%,#7aa2ff 50%)"></span>默认暗</div>
+        <div class="menu-item" data-theme="light"><span class="sw" style="background:linear-gradient(135deg,#ffffff 0 50%,#2f6bff 50%)"></span>默认亮</div>
+        <div class="menu-item" data-theme="github-dark"><span class="sw" style="background:linear-gradient(135deg,#161b22 0 50%,#58a6ff 50%)"></span>GitHub Dark</div>
+        <div class="menu-item" data-theme="ayu-dark"><span class="sw" style="background:linear-gradient(135deg,#0d1017 0 50%,#59c2ff 50%)"></span>Ayu Dark</div>
+        <div class="menu-item" data-theme="everforest-light"><span class="sw" style="background:linear-gradient(135deg,#f4f0d9 0 50%,#3a94c5 50%)"></span>Everforest Light</div>
+        <div class="menu-item" data-theme="iceberg-light"><span class="sw" style="background:linear-gradient(135deg,#f3f4f6 0 50%,#2d539e 50%)"></span>Iceberg Light</div>
+        <div class="menu-item" data-theme="solarized-light"><span class="sw" style="background:linear-gradient(135deg,#eee8d5 0 50%,#268bd2 50%)"></span>Solarized Light</div>
+        <div class="menu-item" data-theme="tokyonight-day"><span class="sw" style="background:linear-gradient(135deg,#eaeaee 0 50%,#2e7de9 50%)"></span>Tokyo Night Day</div>
+        <div class="menu-item" data-theme="zenwritten-light"><span class="sw" style="background:linear-gradient(135deg,#f6f6f6 0 50%,#286486 50%)"></span>Zenwritten Light</div>
+      </div>
+    </div>
   </div>
 </header>
+<div id="spot" class="spot-hidden">
+  <input id="spotInput" placeholder="🔍 搜索标题…" autocomplete="off">
+  <div class="spot-hint">实时过滤 · Enter 打开第一个结果 · Esc 关闭</div>
+</div>
 <div id="notice"></div>
 <div class="grid" id="grid"></div>
-<footer>⭐ 收藏（不关闭，金色=已收藏，再点取消）· 📥 暂存（关闭但记住）· ✕ 关闭 ｜ 顶部「📚 收藏夹」切换视图，点标题打开<b>不消失</b></footer>
+<div id="luckyBox">
+  <div id="luckyTag">I'm Feeling Lucky!</div>
+  <div id="luckyToast"></div>
+</div>
+<div id="lucky" title="I'm Feeling Lucky">🍀</div>
+<footer>
+  <div class="hints">⭐ 收藏 · 📥 关闭但暂存 · ✕ 关闭 · 单击标题栏折叠 · 双击标题栏重命名 · 「📚 收藏夹」切换视图</div>
+  <div class="tagline">All-In-One Tab Board</div>
+  <div class="copyright">Tab Board v0.3.0 · © 2026 carrie.cao · <a href="https://github.com/XinyiCao/tabboard" target="_blank" rel="noopener">GitHub</a> · MIT License</div>
+</footer>
 <script>
-const grid=document.getElementById('grid'), stat=document.getElementById('stat'), search=document.getElementById('search');
+const grid=document.getElementById('grid'), stat=document.getElementById('stat');
+const spot=document.getElementById('spot'), spotInput=document.getElementById('spotInput');
 window.addEventListener('error',e=>{if(stat)stat.textContent="⚠️ JS错误: "+(e.message||e.error);});
 const libBtn=document.getElementById('libBtn'), noticeEl=document.getElementById('notice');
-libBtn.onclick=()=>{mode=(mode==='lib'?'live':'lib');filter='';search.value='';staleOnly=false;reviewDismissed=false;if(lastData)render(lastData);};
+libBtn.onclick=()=>{mode=(mode==='lib'?'live':'lib');filter='';spotInput.value='';staleOnly=false;reviewDismissed=false;if(lastData)render(lastData);};
 noticeEl.addEventListener('click',e=>{
   const now=String(Math.floor(Date.now()/1000));
   if(e.target.classList.contains('rv-show')){staleOnly=true;reviewDismissed=true;localStorage.setItem('tb_lastreview',now);render(lastData);}
   else if(e.target.classList.contains('rv-ok')){reviewDismissed=true;localStorage.setItem('tb_lastreview',now);render(lastData);}
   else if(e.target.classList.contains('rv-all')){staleOnly=false;render(lastData);}
 });
-let lastSig="", filter="", dragging=false, dragMode=null, dragKey=null, staleOnly=false, reviewDismissed=false;
+let lastSig="", filter="", dragging=false, dragMode=null, dragKey=null, staleOnly=false, reviewDismissed=false, editing=false, headerClickTimer=null;
 const collapsed=new Set(JSON.parse(localStorage.getItem('tb_collapsed')||'[]'));
+const names=JSON.parse(localStorage.getItem('tb_names')||'{}');   // 自定义分类名 {key: name}
 
 // 分类顺序（拖动手柄重排，存 localStorage）
 function orderedCats(cats){
@@ -480,12 +614,15 @@ function libItem(t){return `
 function sectionHTML(c){
   const plain=c.parked||c.lib;     // 暂存区/收藏夹：不需要手柄和“关闭整组”
   const grip=plain?'':'<span class="grip" draggable="true" title="拖动调整分组顺序">⠿</span>';
-  const tail=plain?'':`<span class="closeg" data-cat="${c.key}">关闭整组 ✕</span>`;
+  const dispName=names[c.key]||c.name;
+  const tail=plain?'':`<span class="closeg" data-cat="${c.key}">关闭整组 ✕</span>`
+      +(c.custom?`<span class="delcat" data-cat="${c.key}" title="删除此自定义分类（里面的 tab 回到自动分类）">🗑️</span>`:'');
   const itemFn=c.parked?parkedItem:(c.lib?libItem:liveItem);
-  const items=c.tabs.map(itemFn).join("");
+  const items=c.tabs.length ? c.tabs.map(itemFn).join("")
+      : (c.custom?`<li class="hint">把 tab 拖到这里归入「${esc(dispName)}」</li>`:'');
   return `
-    <section class="cat ${collapsed.has(c.key)?'collapsed':''}" data-key="${c.key}">
-      <div class="cat-head">${grip}<span class="caret">▾</span><span class="emoji">${c.emoji}</span><span class="name">${esc(c.name)}</span>
+    <section class="cat ${collapsed.has(c.key)?'collapsed':''}${c.custom?' custom':''}" data-key="${c.key}">
+      <div class="cat-head">${grip}<span class="caret">▾</span><span class="emoji">${c.emoji}</span><span class="name" title="双击重命名">${esc(dispName)}</span>
         <span class="count">${c.tabs.length}</span>${tail}</div>
       <div class="cat-body"><ul>${items}</ul></div>
     </section>`;
@@ -537,7 +674,7 @@ function applyFilter(){
   });
 }
 async function poll(){
-  if(dragging) return;   // 拖动中不重绘，免得打断拖拽
+  if(dragging||editing) return;   // 拖动/重命名中不重绘，免得打断
   try{
     const d=await fetch("/api/tabs").then(r=>r.json());
     const sig=JSON.stringify(d);
@@ -562,13 +699,38 @@ grid.addEventListener('click',async e=>{
   else if(t.classList.contains('closeg')){
     if(confirm("关闭这一整组 tab？")){await api("/api/closegroup",{cat:t.dataset.cat});lastSig="";poll();}
   }
-  else if(t.closest('.cat-head') && !t.classList.contains('grip')){   // 点标题栏：折叠/展开（手柄除外）
+  else if(t.classList.contains('delcat')){
+    if(confirm("删除这个自定义分类？里面的 tab 会回到自动分类（tab 本身不受影响）。")){await api("/api/delcat",{cat:t.dataset.cat});lastSig="";poll();}
+  }
+  else if(t.closest('.cat-head') && !t.classList.contains('grip') && !t.classList.contains('rename')){   // 点标题栏：折叠/展开（手柄/重命名框除外）
     const sec=t.closest('section.cat'), key=sec.dataset.key;
-    const nowCollapsed=sec.classList.toggle('collapsed');
-    nowCollapsed?collapsed.add(key):collapsed.delete(key);
-    localStorage.setItem('tb_collapsed', JSON.stringify([...collapsed]));
+    const toggle=()=>{const nc=sec.classList.toggle('collapsed');nc?collapsed.add(key):collapsed.delete(key);localStorage.setItem('tb_collapsed',JSON.stringify([...collapsed]));};
+    if(t.classList.contains('name')){clearTimeout(headerClickTimer);headerClickTimer=setTimeout(toggle,220);} // 点分类名：延迟，给双击重命名留空档
+    else toggle();                                                                                            // 点三角/其它：即时折叠
   }
 });
+// ---- 双击分类名 = 重命名 ----
+grid.addEventListener('dblclick',e=>{
+  const nameEl=e.target.closest('.name'); if(!nameEl) return;
+  e.preventDefault(); clearTimeout(headerClickTimer);
+  startRename(nameEl);
+});
+function startRename(nameEl){
+  const key=nameEl.closest('section.cat').dataset.key;
+  editing=true;
+  const inp=document.createElement('input');
+  inp.className='rename'; inp.value=nameEl.textContent;
+  nameEl.replaceWith(inp); inp.focus(); inp.select();
+  const done=save=>{
+    if(inp._done) return; inp._done=true;
+    if(save){const v=inp.value.trim(); if(v) names[key]=v; else delete names[key]; localStorage.setItem('tb_names',JSON.stringify(names));} // 空=恢复默认名
+    editing=false; render(lastData);
+  };
+  inp.addEventListener('keydown',e=>{e.stopPropagation(); if(e.key==='Enter')done(true); else if(e.key==='Escape')done(false);});
+  inp.addEventListener('blur',()=>done(true));
+  inp.addEventListener('click',e=>e.stopPropagation());
+  inp.addEventListener('mousedown',e=>e.stopPropagation());
+}
 // ---- 拖拽：抓手柄=挪整个分类模块；抓条目=改归类 ----
 grid.addEventListener('dragstart',e=>{
   if(e.target.classList.contains('grip')){          // 手柄 → 重排分类
@@ -624,9 +786,100 @@ grid.addEventListener('drop',async e=>{
   lastSig=""; poll();
 });
 
+const themeBtn=document.getElementById('themeBtn'), themeMenu=document.getElementById('themeMenu');
+function markTheme(){const cur=document.documentElement.dataset.theme||'dark';themeMenu.querySelectorAll('.menu-item').forEach(it=>it.classList.toggle('active',it.dataset.theme===cur));}
+themeBtn.onclick=e=>{e.stopPropagation();themeMenu.classList.toggle('menu-hidden');markTheme();};
+themeMenu.addEventListener('click',e=>{const it=e.target.closest('.menu-item');if(!it)return;const t=it.dataset.theme;document.documentElement.dataset.theme=t;localStorage.setItem('tb_theme',t);markTheme();themeMenu.classList.add('menu-hidden');});
+document.addEventListener('click',()=>themeMenu.classList.add('menu-hidden'));   // 点别处关闭菜单
+document.getElementById('addcat').onclick=async()=>{
+  const name=prompt("新建分类名称（例如 Arena）：");
+  if(!name||!name.trim()) return;
+  await api("/api/addcat",{name:name.trim()});
+  mode='live'; lastSig=""; poll();      // 切回实时视图，方便把 tab 拖进去
+};
 document.getElementById('dedup').onclick=async()=>{const r=await api("/api/dedup");alert(`已关闭 ${r.removed} 个重复 tab`);lastSig="";poll();};
 document.getElementById('refresh').onclick=()=>{lastSig="";poll();};
-search.addEventListener('input',e=>{filter=e.target.value;applyFilter();});
+// ---- 居中聚焦搜索（Spotlight 风格）----
+function openSpot(){spot.classList.remove('spot-hidden');spotInput.value=filter;spotInput.focus();spotInput.select();}
+function closeSpot(){spot.classList.add('spot-hidden');filter='';applyFilter();}
+const searchBar=document.getElementById('searchBar');
+searchBar.addEventListener('click',openSpot);
+searchBar.addEventListener('focus',openSpot);
+spotInput.addEventListener('input',e=>{filter=e.target.value;applyFilter();});
+spotInput.addEventListener('keydown',e=>{
+  if(e.key==='Escape'){closeSpot();}
+  else if(e.key==='Enter'){
+    const el=[...document.querySelectorAll('.title,.ltitle,.ptitle')].find(x=>x.closest('li').style.display!=='none');
+    if(el) el.click();           // 打开第一个匹配结果（复用点击逻辑）
+    closeSpot();
+  }
+});
+spot.addEventListener('click',e=>{if(e.target===spot) closeSpot();});   // 点空白处关闭
+document.addEventListener('keydown',e=>{                                 // 「/」快捷键唤起
+  if(e.key==='/' && spot.classList.contains('spot-hidden') && !/INPUT|TEXTAREA/.test(document.activeElement.tagName)){
+    e.preventDefault(); openSpot();
+  }
+});
+// ---- 🍀 I'm Feeling Lucky 彩蛋 ----
+const lucky=document.getElementById('lucky'), luckyToast=document.getElementById('luckyToast'), luckyTag=document.getElementById('luckyTag');
+let luckyShown=false, luckyCurrent=null;
+function luckyReveal(){
+  lucky.classList.add('show');
+  lucky.animate([{transform:'rotate(0)'},{transform:'rotate(360deg)'}],{duration:700,easing:'cubic-bezier(.3,1.4,.5,1)'}); // 浮现即旋转
+  confetti();
+  luckyCurrent=luckyPick();                                             // 移过去就抽定一个
+  if(luckyCurrent){
+    luckyTag.classList.add('show');                                    // 无框漂浮的一句话
+    luckyToast.textContent=luckyCurrent.t.title;                       // 框里只放标题
+    luckyToast.classList.add('show');
+    clearTimeout(toastT); toastT=setTimeout(()=>{luckyTag.classList.remove('show');luckyToast.classList.remove('show');},4000);
+  }
+}
+window.addEventListener('mousemove',e=>{
+  const x=e.clientX, y=e.clientY;
+  if(!luckyShown){ if(x>innerWidth-120 && y>innerHeight-120){luckyShown=true; luckyReveal();} }      // 进右下角 → 浮现+旋转+彩屑+提示
+  else if(x<innerWidth-160 || y<innerHeight-160){ luckyShown=false; luckyCurrent=null; lucky.classList.remove('show'); luckyToast.classList.remove('show'); luckyTag.classList.remove('show'); } // 移开 → 全部消失
+});
+let toastT;
+function toast(msg){luckyToast.textContent=msg;luckyToast.classList.add('show');clearTimeout(toastT);toastT=setTimeout(()=>luckyToast.classList.remove('show'),3800);}
+function confetti(){
+  const colors=['var(--accent)','#3ddc84','var(--warn)'];
+  for(let i=0;i<18;i++){
+    const s=document.createElement('span');
+    s.className='confetti';
+    s.style.background=colors[i%colors.length];
+    s.style.right='39px'; s.style.bottom='37px';            // 四叶草中心
+    const sz=4+Math.random()*4; s.style.width=s.style.height=sz+'px';
+    const ang=Math.random()*Math.PI*2, dist=30+Math.random()*64;  // 随机方向、随机距离 → 向四周扩散
+    const dx=Math.cos(ang)*dist, dy=Math.sin(ang)*dist;
+    document.body.appendChild(s);
+    const a=s.animate(
+      [{transform:'translate(0,0) scale(1)',opacity:1},
+       {transform:`translate(${dx}px,${-dy}px) scale(.25)`,opacity:0}],
+      {duration:720+Math.random()*260,easing:'cubic-bezier(.15,.7,.3,1)',fill:'forwards'}
+    );
+    a.onfinish=()=>s.remove();      // 动画一结束立即移除，避免回弹到中心残留
+  }
+}
+function luckyPick(){
+  if(!lastData) return null;
+  const lib=(lastData.library||[]).flatMap(c=>c.tabs);
+  const stale=lib.filter(t=>t.stale);
+  if(stale.length) return {kind:'lib', t:stale[Math.floor(Math.random()*stale.length)], why:'尘封已久的收藏'};   // 优先翻出忘掉的
+  if(lib.length)   return {kind:'lib', t:lib[Math.floor(Math.random()*lib.length)],     why:'收藏夹'};
+  const live=(lastData.cats||[]).flatMap(c=>c.tabs);
+  if(live.length)  return {kind:'live', t:live[Math.floor(Math.random()*live.length)],  why:'当前 tab'};
+  return null;
+}
+lucky.onclick=()=>{
+  const p=luckyCurrent;                          // 用 hover 时已抽定的那一个
+  if(!p){toast('🍀 还没东西可抽 —— 先收藏点什么？');return;}
+  setTimeout(async()=>{                           // 点击才跳转
+    if(p.kind==='lib') await api('/api/libopen',{url:p.t.url});
+    else await api('/api/activate',{wid:p.t.wid,tid:p.t.tid});
+    lastSig=''; poll();
+  }, 250);
+};
 poll();setInterval(poll,2000);
 </script></body></html>"""
 
