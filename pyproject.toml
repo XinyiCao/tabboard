@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "carrie-tabboard"
-version = "0.3.0"
+version = "0.3.1"
 description = "实时 Chrome tab 看板：自动归类、跳转/关闭/暂存/收藏、拖动改归类与重排、久未访问清理、自动备份 (macOS)"
 readme = "README.md"
 requires-python = ">=3.9"

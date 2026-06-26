@@ -6,10 +6,63 @@ Carrie's Tab Board — 动态 Chrome tab 看板
 支持：点标题跳到真实 tab、关单个、一键去重、整组关闭。
 运行： python3 tab_board.py   然后浏览器打开 http://localhost:8765
 """
-import json, re, subprocess, threading, webbrowser, time
+import json, re, subprocess, threading, webbrowser, time, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from pathlib import Path
+
+# ========== 演示模式（python3 tab_board.py --demo）==========
+# 用预置假数据展示全部功能，不读取真实 Chrome、不读写真实数据文件。适合录 demo / 别人试用。
+DEMO = "--demo" in sys.argv
+
+DEMO_CATS = [
+    ("meetings",   "🗓️", "Meetings & Notes"),
+    ("docs",       "📄", "Docs & Specs"),
+    ("dev",        "💻", "Dev & Code"),
+    ("dashboards", "📊", "Dashboards"),
+    ("reading",    "📚", "Reading List"),
+    ("personal",   "🎧", "Personal"),
+    ("other",      "📦", "Uncategorized"),
+]
+DEMO_RULES = [
+    ("meetings",   ["1:1", "meeting", "standup", "sync", "notes", "okr", "retro"]),
+    ("docs",       ["spec", "prd", "roadmap", "proposal", "doc", "plan", "brief"]),
+    ("dev",        ["github", "pull request", "stack overflow", "localhost", "api", "deploy", "ci/cd"]),
+    ("dashboards", ["dashboard", "analytics", "metrics", "grafana", "report"]),
+    ("reading",    ["blog", "article", "guide", "tutorial", "medium", "newsletter"]),
+    ("personal",   ["youtube", "spotify", "gmail", "calendar", "amazon", "lo-fi"]),
+]
+DEMO_HOST_RULES = [
+    ("dev", ["github.com", "stackoverflow.com"]),
+    ("personal", ["youtube.com", "mail.google.com", "spotify.com", "amazon.com"]),
+]
+DEMO_TABS = [
+    {"wid":"1","tid":"d01","title":"Alex / Jordan — 1:1 Notes","url":"https://notes.example.com/1on1-alex"},
+    {"wid":"1","tid":"d02","title":"Q3 Planning — Meeting Notes","url":"https://notes.example.com/q3-planning"},
+    {"wid":"1","tid":"d03","title":"Engineering Weekly Sync","url":"https://notes.example.com/eng-sync"},
+    {"wid":"1","tid":"d04","title":"Sprint Retro — Action Items","url":"https://notes.example.com/retro"},
+    {"wid":"1","tid":"d05","title":"PRD: Checkout Redesign","url":"https://docs.example.com/prd-checkout"},
+    {"wid":"1","tid":"d06","title":"API Spec v2 — Authentication","url":"https://docs.example.com/api-spec"},
+    {"wid":"1","tid":"d07","title":"2025 Product Roadmap","url":"https://docs.example.com/roadmap"},
+    {"wid":"1","tid":"d08","title":"Design Proposal — Onboarding Flow","url":"https://docs.example.com/proposal-onboarding"},
+    {"wid":"1","tid":"d09","title":"acme/web · Pull Request #482","url":"https://github.com/acme/web/pull/482"},
+    {"wid":"1","tid":"d10","title":"async/await best practices — Stack Overflow","url":"https://stackoverflow.com/q/123456"},
+    {"wid":"1","tid":"d11","title":"localhost:3000 — Local Dev","url":"http://localhost:3000/"},
+    {"wid":"1","tid":"d12","title":"CI/CD Deploy Pipeline","url":"https://ci.example.com/pipeline"},
+    {"wid":"1","tid":"d13","title":"Product Analytics Dashboard","url":"https://analytics.example.com/overview"},
+    {"wid":"1","tid":"d14","title":"Grafana — Service Metrics","url":"https://grafana.example.com/d/abc"},
+    {"wid":"1","tid":"d15","title":"The Pragmatic Engineer — Blog","url":"https://blog.example.com/pragmatic"},
+    {"wid":"1","tid":"d16","title":"Rust Ownership — Tutorial","url":"https://guide.example.com/rust-ownership"},
+    {"wid":"1","tid":"d17","title":"Lo-fi beats to code to — YouTube","url":"https://www.youtube.com/watch?v=demo"},
+    {"wid":"1","tid":"d18","title":"Gmail — Inbox","url":"https://mail.google.com/"},
+    {"wid":"1","tid":"d19","title":"Amazon — Order History","url":"https://www.amazon.com/orders"},
+]
+def demo_library_seed():
+    now = int(time.time())
+    return {
+        "https://docs.example.com/roadmap": {"url":"https://docs.example.com/roadmap","title":"2025 Product Roadmap","ts":now-60*86400,"last_opened":now-45*86400},  # 尘封（>30天）
+        "https://blog.example.com/pragmatic": {"url":"https://blog.example.com/pragmatic","title":"The Pragmatic Engineer — Blog","ts":now-5*86400,"last_opened":now-2*86400},
+    }
 
 PORT = 8765
 US, RS = "\x1f", "\x1e"   # field / record separators
@@ -30,16 +83,20 @@ CATS = [
     ("pbday",   "🎉", "Personal · 生日派对 & Shopping"),
     ("other",   "📦", "其他 / 未分类"),
 ]
+if DEMO: CATS = DEMO_CATS
+
 # ---------- 自定义分类（用户新建，参与分组，持久化）----------
 CATEGORIES_FILE = Path.home() / ".tabboard_categories.json"
 
 def load_categories():
+    if DEMO: return []
     try:
         return json.loads(CATEGORIES_FILE.read_text(encoding="utf-8"))
     except Exception:
         return []
 
 def save_categories(d):
+    if DEMO: return
     try:
         backup_file(CATEGORIES_FILE)
         CATEGORIES_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -81,6 +138,9 @@ HOST_RULES = [  # 按域名兜底
     ("pmail", ["mail.google.com", "youtube.com", "youtube.studio", "studio.youtube.com"]),
     ("pbday", ["gemini.google.com", "ezcontacts.com"]),
 ]
+if DEMO:
+    RULES = DEMO_RULES
+    HOST_RULES = DEMO_HOST_RULES
 
 # ---------- 自动备份（每次写入前，把旧版本存一份带时间戳的快照）----------
 BACKUP_DIR = Path.home() / ".tabboard_backups"
@@ -103,12 +163,14 @@ def backup_file(path, keep=20):
 OVERRIDES_FILE = Path.home() / ".tabboard_overrides.json"
 
 def load_overrides():
+    if DEMO: return {}
     try:
         return json.loads(OVERRIDES_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 def save_overrides(d):
+    if DEMO: return
     try:
         backup_file(OVERRIDES_FILE)
         OVERRIDES_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -121,12 +183,14 @@ OVERRIDES = load_overrides()   # {url: cat_key}
 PARKED_FILE = Path.home() / ".tabboard_parked.json"
 
 def load_parked():
+    if DEMO: return {}
     try:
         return json.loads(PARKED_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 def save_parked(d):
+    if DEMO: return
     try:
         backup_file(PARKED_FILE)
         PARKED_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -139,12 +203,14 @@ PARKED = load_parked()   # {url: {url, title, ts}}
 LIBRARY_FILE = Path.home() / ".tabboard_library.json"
 
 def load_library():
+    if DEMO: return demo_library_seed()
     try:
         return json.loads(LIBRARY_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 def save_library(d):
+    if DEMO: return
     try:
         backup_file(LIBRARY_FILE)
         LIBRARY_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -187,6 +253,7 @@ end tell
 '''
 
 def read_tabs():
+    if DEMO: return list(DEMO_TABS)
     raw = osa(READ)
     tabs = []
     for rec in raw.split(RS):
@@ -231,6 +298,7 @@ def grouped():
             "library": group_by_cat(libvals)}
 
 def activate(wid, tid):
+    if DEMO: return                       # 演示模式：点标题不跳转真实 tab
     osa(f'''tell application "Google Chrome"
       set theWin to window id {wid}
       set i to 0
@@ -246,6 +314,10 @@ def activate(wid, tid):
     end tell''')
 
 def close_tab(wid, tid):
+    if DEMO:
+        global DEMO_TABS
+        DEMO_TABS = [t for t in DEMO_TABS if t["tid"] != tid]
+        return
     osa(f'tell application "Google Chrome" to close (every tab of window id {wid} whose id is {tid})')
 
 def close_group(cat):
@@ -263,6 +335,10 @@ def dedup():
     return removed
 
 def read_one(wid, tid):
+    if DEMO:
+        for t in DEMO_TABS:
+            if t["tid"] == tid: return t["title"], t["url"]
+        return None, None
     out = osa(f'''tell application "Google Chrome"
       set US to (ASCII character 31)
       set L to (every tab of window id {wid} whose id is {tid})
@@ -284,6 +360,12 @@ def park(wid, tid):
     close_tab(wid, tid)
 
 def open_url(url):
+    if DEMO:                               # 演示模式：把它当作“重新打开”，加回实时列表
+        global DEMO_TABS
+        if not any(t["url"] == url for t in DEMO_TABS):
+            title = (LIBRARY.get(url) or {}).get("title", url)
+            DEMO_TABS = DEMO_TABS + [{"wid":"1","tid":"o"+str(int(time.time()*1000)%1000000),"title":title,"url":url}]
+        return
     safe = url.replace("\\", "\\\\").replace('"', '\\"')
     osa(f'''tell application "Google Chrome"
       if (count of windows) = 0 then make new window
@@ -364,7 +446,7 @@ class H(BaseHTTPRequestHandler):
         if self.path.startswith("/api/tabs"):
             self._send(json.dumps(grouped()))
         else:
-            self._send(PAGE.replace("__PORT__", str(PORT)), "text/html")
+            self._send(PAGE.replace("__PORT__", str(PORT)).replace("__DEMOBADGE__", '<span class="demobadge">🎬 DEMO</span>' if DEMO else ""), "text/html")
 
     def do_POST(self):
         ln = int(self.headers.get("Content-Length", 0))
@@ -407,6 +489,7 @@ body{margin:0;font-family:-apple-system,"PingFang SC","Segoe UI",Roboto,Arial,sa
 header{position:sticky;top:0;z-index:20;background:var(--headerbg);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);padding:12px 22px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
 header h1{font-size:17px;margin:0;font-weight:600}
 .stat{color:var(--muted);font-size:12.5px}
+.demobadge{font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--warn);border:1px solid var(--warn);border-radius:999px;padding:1px 8px;align-self:center}
 .dot{width:7px;height:7px;border-radius:50%;background:#3ddc84;display:inline-block;margin-right:5px;animation:p 2s infinite}
 @keyframes p{50%{opacity:.3}}
 .controls{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
@@ -500,7 +583,7 @@ footer{color:var(--muted);font-size:11.5px;padding:0 22px 40px;text-align:center
 </style></head><body>
 <script>document.documentElement.dataset.theme=localStorage.getItem('tb_theme')||'dark';</script>
 <header>
-  <h1>📑 Tab Board</h1>
+  <h1>📑 Tab Board</h1>__DEMOBADGE__
   <span class="stat"><span class="dot"></span><span id="stat">读取中…</span></span>
   <div class="controls">
     <input class="searchbar" id="searchBar" placeholder="🔍 搜索标题…" readonly>
@@ -538,7 +621,7 @@ footer{color:var(--muted);font-size:11.5px;padding:0 22px 40px;text-align:center
 <footer>
   <div class="hints">⭐ 收藏 · 📥 关闭但暂存 · ✕ 关闭 · 单击标题栏折叠 · 双击标题栏重命名 · 「📚 收藏夹」切换视图</div>
   <div class="tagline">All-In-One Tab Board</div>
-  <div class="copyright">Tab Board v0.3.0 · © 2026 carrie.cao · <a href="https://github.com/XinyiCao/tabboard" target="_blank" rel="noopener">GitHub</a> · MIT License</div>
+  <div class="copyright">Tab Board v0.3.1 · © 2026 carrie.cao · <a href="https://github.com/XinyiCao/tabboard" target="_blank" rel="noopener">GitHub</a> · MIT License</div>
 </footer>
 <script>
 const grid=document.getElementById('grid'), stat=document.getElementById('stat');
@@ -893,6 +976,8 @@ def main():
             webbrowser.open(url)
             return
         raise
+    if DEMO:
+        print("🎬 演示模式：使用预置假数据，不读取真实 Chrome，也不读写真实数据文件。")
     print(f"✅ Tab Board 运行中 → {url}  (Ctrl+C 停止)")
     threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:

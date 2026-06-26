@@ -4,6 +4,12 @@
 
 > **仅支持 macOS + Google Chrome**（通过 AppleScript 读取并控制本机 Chrome）。纯 Python 标准库，无第三方依赖。
 
+<p align="center">
+  <img src="docs/demo.gif" alt="Tab Board 演示" width="840">
+</p>
+
+<p align="center"><sub>演示用内置 <code>--demo</code> 模式（假数据）录制 · <a href="docs/demo.mp4">高清 MP4</a></sub></p>
+
 ---
 
 ## 目录
@@ -46,6 +52,12 @@ tabboard                                  # 之后任何目录敲这一个词即
 > 用 `pipx install --editable ~/Desktop/tabboard` 安装，则改源码后命令即时生效，无需重装。
 
 **端口被占用时**：再次运行会检测到“已在运行”，直接打开浏览器而不报错。
+
+**演示 / 试用（不读真实 Chrome）：**
+```bash
+python3 ~/Desktop/tabboard/tab_board.py --demo   # 或 tabboard --demo
+```
+用一组预置假标签页展示全部功能，**不读取真实 Chrome、不读写任何真实数据文件**。适合录屏、截图、或没有 Mac/Chrome 时快速体验。顶部会显示「🎬 DEMO」徽标。
 
 ---
 
